@@ -12,6 +12,7 @@ from pants.option.option_types import (
     DictOption,
     FileOption,
     SkipOption,
+    StrListOption,
 )
 from pants.util.strutil import softwrap
 
@@ -122,6 +123,25 @@ class BufSubsystem(TemplatedExternalTool):
                 extra_plugin_pins = {
                   "myorg.example.com/internal/python-fork": "v2.0:3",
                 }
+            """
+        ),
+        advanced=True,
+    )
+
+    plugins = StrListOption(
+        default=[],
+        help=softwrap(
+            """
+            Addresses of packageable targets that build Buf check plugins
+            (https://buf.build/docs/cli/buf-plugins/), e.g.
+            `["//src/checks:buf-plugin-example"]`.
+
+            Pants builds each one and places it on `PATH` for `buf lint`, so that a
+            `plugins:` entry in `buf.yaml` naming it can be resolved. Buf executes that
+            entry verbatim, so the target name must match the name `buf.yaml` uses.
+
+            Without this, `buf lint` fails whenever `buf.yaml` declares a local plugin,
+            because the sandbox contains only Buf, the protos, and the config.
             """
         ),
         advanced=True,

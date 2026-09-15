@@ -9,6 +9,7 @@ import shlex
 from dataclasses import dataclass
 
 from pants.backend.codegen.protobuf.buf.config import (
+    LanguageGenTemplate,
     MissingBufLockError,
     gen_template_request_for_target,
     parse_buf_yaml_deps,
@@ -19,6 +20,9 @@ from pants.backend.codegen.protobuf.buf.subsystem import BufSubsystem
 from pants.backend.codegen.protobuf.protoc import Protoc
 from pants.backend.python.util_rules.pex_environment import PexEnvironment
 from pants.backend.codegen.protobuf.python.additional_fields import PythonSourceRootField
+from pants.backend.codegen.protobuf.python.python_protobuf_subsystem import (
+    PythonProtobufSubsystem,
+)
 from pants.backend.codegen.protobuf.target_types import ProtobufSourceField
 from pants.core.util_rules.config_files import find_config_file
 from pants.core.goals.package import (
@@ -154,6 +158,7 @@ async def _build_codegen_plugins(buf: BufSubsystem, complete_pex_env) -> Digest:
 async def generate_python_from_protobuf_via_buf(
     request: GeneratePythonFromProtobufViaBufRequest,
     buf: BufSubsystem,
+    python_protobuf: PythonProtobufSubsystem,
     protoc: Protoc,
     platform: Platform,
     pex_environment: PexEnvironment,
@@ -196,7 +201,10 @@ async def generate_python_from_protobuf_via_buf(
     download_buf_request = download_external_tool(buf.get_request(platform))
     download_protoc_request = download_external_tool(protoc.get_request(platform))
     config_files_request = find_config_file(buf.config_request)
-    gen_template_files_request = find_config_file(gen_template_request_for_target(target, buf))
+    language_template = LanguageGenTemplate.from_option(python_protobuf, "buf_gen_template")
+    gen_template_files_request = find_config_file(
+        gen_template_request_for_target(target, buf, language_template)
+    )
 
     (
         downloaded_buf,
@@ -287,7 +295,7 @@ async def generate_python_from_protobuf_via_buf(
     )
 
     config_arg = ["--config", buf.config] if buf.config else []
-    template_path = resolved_template_path(target, buf)
+    template_path = resolved_template_path(target, buf, language_template)
     template_arg = ["--template", template_path] if template_path else []
 
     # Read the same switch that shapes the sandbox so the two can't disagree.

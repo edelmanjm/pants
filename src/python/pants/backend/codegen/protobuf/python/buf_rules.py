@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 
 from pants.backend.codegen.protobuf.buf.config import (
@@ -16,14 +17,35 @@ from pants.backend.codegen.protobuf.buf.config import (
 )
 from pants.backend.codegen.protobuf.buf.subsystem import BufSubsystem
 from pants.backend.codegen.protobuf.protoc import Protoc
+from pants.backend.python.util_rules.pex_environment import PexEnvironment
 from pants.backend.codegen.protobuf.python.additional_fields import PythonSourceRootField
 from pants.backend.codegen.protobuf.target_types import ProtobufSourceField
 from pants.core.util_rules.config_files import find_config_file
+from pants.core.goals.package import (
+    EnvironmentAwarePackageRequest,
+    PackageFieldSet,
+    environment_aware_package,
+)
 from pants.core.util_rules.external_tool import download_external_tool
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
-from pants.engine.fs import CreateDigest, Directory, FileContent, MergeDigests, RemovePrefix
+from pants.engine.fs import (
+    EMPTY_DIGEST,
+    AddPrefix,
+    CreateDigest,
+    Digest,
+    Directory,
+    FileContent,
+    MergeDigests,
+    RemovePrefix,
+)
+from pants.engine.internals.graph import (
+    find_valid_field_sets,
+    resolve_targets,
+    resolve_unparsed_address_inputs,
+)
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
 from pants.engine.intrinsics import (
+    add_prefix,
     create_digest,
     digest_to_snapshot,
     get_digest_contents,
@@ -33,7 +55,13 @@ from pants.engine.intrinsics import (
 from pants.engine.platform import Platform
 from pants.engine.process import Process, execute_process_or_raise
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
-from pants.engine.target import GeneratedSources, Target, TransitiveTargetsRequest
+from pants.engine.addresses import Addresses, UnparsedAddressInputs
+from pants.engine.target import (
+    FieldSetsPerTargetRequest,
+    GeneratedSources,
+    Target,
+    TransitiveTargetsRequest,
+)
 from pants.util.logging import LogLevel
 
 logger = logging.getLogger(__name__)
@@ -44,12 +72,91 @@ class GeneratePythonFromProtobufViaBufRequest:
     protocol_target: Target
 
 
+# Codegen plugin executables are gathered here rather than left at their `output_path`, so that
+# PATH names only them -- pointing it at the sandbox root would make the protos, the config and
+# buf itself executable from it. Mirrors `_PLUGIN_DIR` in the `buf lint` rules.
+_CODEGEN_PLUGIN_DIR = "_buf_codegen_plugins"
+
+
+async def _build_codegen_plugins(buf: BufSubsystem, complete_pex_env) -> Digest:
+    """Build `[buf].codegen_plugins` into `_CODEGEN_PLUGIN_DIR` so buf can exec them by name.
+
+    Each target is packaged, then fronted by a small wrapper named after the target -- which
+    is the name the `buf.gen.yaml` template uses. The wrapper exists because a packaged PEX
+    is not directly executable in the sandbox: its shebang names an interpreter that is not
+    on the sandbox's PATH. `CompletePexEnvironment.create_argv` builds the interpreter-plus-
+    PEX argv that runs it, and the wrapper is just that argv.
+    """
+    if not buf.codegen_plugins:
+        return EMPTY_DIGEST
+
+    addresses = await resolve_unparsed_address_inputs(
+        UnparsedAddressInputs(
+            buf.codegen_plugins,
+            owning_address=None,
+            description_of_origin=f"the `[{BufSubsystem.options_scope}].codegen_plugins` option",
+        ),
+        **implicitly(),
+    )
+    targets = await resolve_targets(**implicitly({addresses: Addresses}))
+    field_sets_per_target = await find_valid_field_sets(
+        FieldSetsPerTargetRequest(PackageFieldSet, targets), **implicitly()
+    )
+    for address, field_sets in zip(addresses, field_sets_per_target.collection):
+        if not field_sets:
+            raise ValueError(
+                f"`[{BufSubsystem.options_scope}].codegen_plugins` names {address.spec}, which "
+                "cannot be packaged. Name a target that produces a binary, such as `pex_binary`."
+            )
+
+    packages = await concurrently(
+        environment_aware_package(EnvironmentAwarePackageRequest(field_set))
+        for field_set in field_sets_per_target.field_sets
+    )
+
+    wrappers = []
+    for address, package in zip(addresses, packages):
+        for artifact in package.artifacts:
+            if artifact.relpath is None:
+                continue
+            argv = complete_pex_env.create_argv(f"{_CODEGEN_PLUGIN_DIR}/{artifact.relpath}")
+            # The buf process itself gets only `PATH`, so the PEX's own environment -- above
+            # all `PEX_ROOT`, which points at the append-only cache the PEX unpacks into --
+            # has to be set here. `python_configured=True` because `create_argv` names the
+            # interpreter outright, so Pex must not go looking for another one.
+            exports = "".join(
+                f"export {name}={shlex.quote(value)}\n"
+                for name, value in sorted(
+                    complete_pex_env.environment_dict(python_configured=True).items()
+                )
+            )
+            wrappers.append(
+                FileContent(
+                    f"{_CODEGEN_PLUGIN_DIR}/{address.target_name}",
+                    f"#!/bin/sh\n{exports}exec {shlex.join(argv)} \"$@\"\n".encode(),
+                    is_executable=True,
+                )
+            )
+
+    artifacts, wrapper_digest = await concurrently(
+        add_prefix(
+            AddPrefix(
+                await merge_digests(MergeDigests(package.digest for package in packages)),
+                _CODEGEN_PLUGIN_DIR,
+            )
+        ),
+        create_digest(CreateDigest(wrappers)),
+    )
+    return await merge_digests(MergeDigests((artifacts, wrapper_digest)))
+
+
 @rule(desc="Generate Python from Protobuf via `buf generate`", level=LogLevel.DEBUG)
 async def generate_python_from_protobuf_via_buf(
     request: GeneratePythonFromProtobufViaBufRequest,
     buf: BufSubsystem,
     protoc: Protoc,
     platform: Platform,
+    pex_environment: PexEnvironment,
 ) -> GeneratedSources:
     target = request.protocol_target
 
@@ -84,6 +191,8 @@ async def generate_python_from_protobuf_via_buf(
         SourceFilesRequest([target[ProtobufSourceField]])
     )
 
+    complete_pex_env = pex_environment.in_sandbox(working_directory=None)
+    codegen_plugins_request = _build_codegen_plugins(buf, complete_pex_env)
     download_buf_request = download_external_tool(buf.get_request(platform))
     download_protoc_request = download_external_tool(protoc.get_request(platform))
     config_files_request = find_config_file(buf.config_request)
@@ -95,6 +204,7 @@ async def generate_python_from_protobuf_via_buf(
         empty_output_dir,
         all_sources,
         target_sources,
+        codegen_plugins_digest,
         config_files,
         gen_template_files,
     ) = await concurrently(
@@ -103,6 +213,7 @@ async def generate_python_from_protobuf_via_buf(
         create_output_dir_request,
         all_sources_request,
         target_sources_request,
+        codegen_plugins_request,
         config_files_request,
         gen_template_files_request,
     )
@@ -166,6 +277,7 @@ async def generate_python_from_protobuf_via_buf(
         MergeDigests(
             (
                 all_sources.snapshot.digest,
+                codegen_plugins_digest,
                 empty_output_dir,
                 downloaded_buf.digest,
                 config_files.snapshot.digest,
@@ -204,6 +316,14 @@ async def generate_python_from_protobuf_via_buf(
     # entries.
     protoc_relpath = "__protoc"
     protoc_bin_dir = os.path.join(protoc_relpath, os.path.dirname(downloaded_protoc.exe))
+    # Buf resolves a bare `local:` entry off PATH, and refuses to exec a binary found via a
+    # relative PATH entry -- hence `{chroot}`, replaced with the sandbox's absolute path at
+    # execution time.
+    path = (
+        f"{protoc_bin_dir}:{os.path.join('{chroot}', _CODEGEN_PLUGIN_DIR)}"
+        if buf.codegen_plugins
+        else protoc_bin_dir
+    )
 
     result = await execute_process_or_raise(
         **implicitly(
@@ -211,7 +331,8 @@ async def generate_python_from_protobuf_via_buf(
                 argv=argv,
                 input_digest=input_digest,
                 immutable_input_digests={protoc_relpath: downloaded_protoc.digest},
-                env={"PATH": protoc_bin_dir},
+                env={"PATH": path},
+                append_only_caches=complete_pex_env.append_only_caches,
                 description=f"Generating Python from Protobuf via buf for {target.address}.",
                 level=LogLevel.DEBUG,
                 output_directories=(output_dir,),

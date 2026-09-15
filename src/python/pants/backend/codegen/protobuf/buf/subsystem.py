@@ -147,6 +147,26 @@ class BufSubsystem(TemplatedExternalTool):
         advanced=True,
     )
 
+    codegen_plugins = StrListOption(
+        default=[],
+        help=softwrap(
+            """
+            Addresses of packageable targets that build `local:` plugins named by a
+            `buf.gen.yaml` template, e.g. `["//src/gen:protoc-gen-example"]`.
+
+            Pants builds each one and places it on `PATH` for `buf generate`, so a bare
+            `local: <name>` entry resolves. Buf execs that entry verbatim, so the target
+            name must match the name the template uses.
+
+            Without this, a `local:` entry has to name a path outside the sandbox. That
+            runs, but it leaves the generator outside the process's input digest: editing
+            the generator or its templates will not invalidate the cached codegen, so the
+            build quietly serves stale output.
+            """
+        ),
+        advanced=True,
+    )
+
     @property
     def config_request(self) -> ConfigFilesRequest:
         # Refer to https://docs.buf.build/configuration/overview.
